@@ -1,39 +1,52 @@
 ##############################################
-# Parallel timelag calculation for 3 gases
+# Parallel timelag calculation (3 gases)
 # using future.apply (robust, stable)
 ##############################################
 
 library(RFlux)
 library(forecast)
-library(future)
-library(future.apply)
-library(progressr)
+library(future) # for the parallel sessions
+library(future.apply) 
+library(progressr) # for the progress bar
+library(tcltk)  # for file selection dialog
 
 # -------------------
-# PARALLEL & PROGRESS SETTINGS
+# MAIN SETTINGS!!!
 
-plan(multisession, workers = parallel::detectCores() - 1)
-options(future.globals.maxSize = 8e9)  # allow large data
+year <- "2025"
 
-handlers(handler_txtprogressbar())
-
-# -------------------
-# MAIN SETTINGS - ADJUST FOR YUOUR OWN PROJECT!
-
-year <- "2025" # REPLACE WITH YOUR OWN!
-input_folder  <- "I:/Sinikula/raw/" # REPLACE WITH YOUR OWN!
-output_folder <- "I:/Sinikula/timelag_opt/" # REPLACE WITH YOUR OWN!
+input_folder  <- "I:/Sinikula/raw"
+output_folder <- "I:/Sinikula/timelag_opt/"
 
 gas_settings <- list(
   list(name = "N2O", scalar_column = 4),
   list(name = "CH4", scalar_column = 7),
   list(name = "CO2", scalar_column = 9)
 )
-
 wind_x_col <- 10
 wind_y_col <- 11
 wind_z_col <- 12
 temp_col   <- 13
+
+file_list <- list.files(input_folder, pattern = "\\.dat$", full.names = TRUE)
+cat("Found", length(file_list), "files to process.\n")
+
+# If you want to manually choose new files, then uncomment this:
+# NB! Will not work if you have too many files
+# -------------------
+# SELECT INPUT FILES (Windows-friendly) 
+#file_list <- utils::choose.files(
+#  default = file.path(input_folder, "*.dat"), 
+#  caption = "Select one or more input .dat files", 
+#  multi = TRUE, filters = c("DAT files (*.dat)", "*.dat") 
+#) 
+#if (length(file_list) == 0) { 
+#  stop("No files selected. Exiting script.") 
+#} 
+#cat("Selected", length(file_list), "files to process.\n")
+
+# -------------------------------------------------------------------------
+
 
 if (!dir.exists(output_folder)) {
   dir.create(output_folder, recursive = TRUE)
@@ -43,8 +56,16 @@ if (!dir.exists(output_folder)) {
 }
 
 # -------------------
-# FUNCTIONS
+# PARALLEL & PROGRESS SETTINGS
 
+plan(multisession, workers = parallel::detectCores() - 1)
+options(future.globals.maxSize = 8e9)  # allow large data
+
+handlers(handler_txtprogressbar())
+
+
+# -------------------
+# DESPIKING FUNCTION
 mad_despike <- function(data, column_index, threshold = 5) {
   column <- data[[column_index]]
   median_val <- median(column, na.rm = TRUE)
@@ -55,6 +76,8 @@ mad_despike <- function(data, column_index, threshold = 5) {
   return(data)
 }
 
+# -------------------
+# DOUBLE COORDINATE ROTATION FUNCTION
 double_coordinate_rotation <- function(data, x_col, y_col, z_col) {
   u_mean <- mean(data[[x_col]], na.rm = TRUE)
   v_mean <- mean(data[[y_col]], na.rm = TRUE)
@@ -71,12 +94,6 @@ double_coordinate_rotation <- function(data, x_col, y_col, z_col) {
   data[[z_col]] <- w_rot2
   return(data)
 }
-
-# -------------------
-# LOAD FILE LIST
-
-file_list <- list.files(input_folder, pattern = "\\.dat$", full.names = TRUE)
-cat("Found", length(file_list), "files to process.\n")
 
 # -------------------
 # MAIN PARALLEL LOOP WITH PROGRESS BAR
@@ -194,7 +211,7 @@ for (res in results_list) {
 }
 
 # -------------------
-# SAVE RESULTS PER GAS
+# SAVE RESULTS PER GAS (append or create CSV, ensure datetime)
 
 for (g in gas_settings) {
   gas_name <- g$name
@@ -203,54 +220,57 @@ for (g in gas_settings) {
   combined <- do.call(rbind, results_by_gas[[gas_name]])
   
   # Add HDI (95% highest density interval)
-  # pwb_uci - pwb_lci 
-  # ----------------------------------------------
   if (all(c("pwb_uci","pwb_lci") %in% names(combined))) {
     combined$HDI <- combined$pwb_uci - combined$pwb_lci
   } else {
     combined$HDI <- NA
   }
   
-  # ----------------------------------------------
+  # Construct output file path
+  out_csv <- file.path(output_folder, paste0(gas_name, "_tlag_results_", year, ".csv"))
+  
+  # -------------------
   # Add datetime parsed from Filename
-  # ----------------------------------------------
-  parts <- strsplit(combined$Filename, "_")
+  parts <- strsplit(as.character(combined$Filename), "_")
   
-  # Extract components (site, year, month, day, HHMM)
-  combined$year   <- as.integer(sapply(parts, `[`, 2))
-  combined$month  <- as.integer(sapply(parts, `[`, 3))
-  combined$day    <- as.integer(sapply(parts, `[`, 4))
-  hm              <- sapply(parts, `[`, 5)
+  year_   <- as.integer(sapply(parts, `[`, 2))
+  month_  <- as.integer(sapply(parts, `[`, 3))
+  day_    <- as.integer(sapply(parts, `[`, 4))
+  hm      <- sapply(parts, `[`, 5)
+  hour_   <- as.integer(substr(hm, 1, 2))
+  minute_ <- as.integer(substr(hm, 3, 4))
   
-  combined$hour   <- as.integer(substr(hm, 1, 2))
-  combined$minute <- as.integer(substr(hm, 3, 4))
-  
-  # Create POSIXct datetime (assumes local time)
   combined$datetime <- as.POSIXct(
-    sprintf("%04d-%02d-%02d %02d:%02d:00",
-            combined$year,
-            combined$month,
-            combined$day,
-            combined$hour,
-            combined$minute),
-    format = "%Y-%m-%d %H:%M:%S"
+    sprintf("%04d-%02d-%02d %02d:%02d:00", year_, month_, day_, hour_, minute_),
+    format = "%Y-%m-%d %H:%M:%S",
+    tz = "UTC"
   )
   
-  # ----------------------------------------------
-
+  # Remove temporary columns
+  # combined$year <- combined$month <- combined$day <- combined$hour <- combined$minute <- NULL
   
-  # Optional: remove temporary columns if you like
-   combined$year <- combined$month <- combined$day <- combined$hour <- combined$minute <- NULL
+  if (file.exists(out_csv)) {
+    # Read existing CSV
+    existing <- read.csv(out_csv, stringsAsFactors = FALSE)
+    
+    # Convert datetime column back to POSIXct
+    if ("datetime" %in% names(existing)) {
+      existing$datetime <- as.POSIXct(existing$datetime, format = "%Y-%m-%d %H:%M:%S", tz = "")
+    }
+    
+    # Remove rows that have the same Filename as new data
+    existing <- existing[!existing$Filename %in% combined$Filename, ]
+    
+    # Combine old and new data
+    combined <- rbind(existing, combined)
+  }
   
-  
-  out_csv <- file.path(
-    output_folder,
-    paste0(gas_name, "_tlag_results_", year, ".csv")
-  )
-  
-  write.csv(combined, out_csv, row.names = FALSE)
-  
+  # Before saving, ensure datetime column is POSIXct
+  combined$datetime <- as.POSIXct(combined$datetime, format = "%Y-%m-%d %H:%M:%S", tz = "UTC")
+  # Sort by first column (Filename) before saving
+  combined <- combined[order(combined$Filename), ]
+  # Save CSV
+  write.csv(combined, out_csv, row.names = FALSE, quote = TRUE)
   message(" → ", out_csv)
 }
-
 message("\nALL DONE ✅\n")
